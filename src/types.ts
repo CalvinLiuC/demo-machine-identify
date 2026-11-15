@@ -1,4 +1,5 @@
 import type { BufferGeometry } from "three";
+import type { SceneAnalysis } from "./scene-analysis.ts";
 export type Vec3 = [number, number, number];
 export type JointType = "fixed" | "revolute" | "prismatic";
 export interface Joint {
@@ -12,6 +13,7 @@ export interface Joint {
   mimic?: string;
   multiplier?: number;
   offset?: number;
+  resolution?: "candidate" | "unresolved";
 }
 export interface Link {
   id: string;
@@ -21,6 +23,7 @@ export interface Link {
   bind: number[];
   joint: Joint;
   confirmed: boolean;
+  kinematicIndex?: number;
 }
 export interface Device {
   id: string;
@@ -44,4 +47,6 @@ export interface Project {
   links: Link[];
   meshes: GeometryItem[];
   notes: string[];
+  analysis?: SceneAnalysis;
+  appliedAnalysisId?: string;
 }

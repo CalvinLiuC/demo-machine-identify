@@ -3,7 +3,7 @@ import type { GeometryItem, Vec3 } from "./types.ts";
 
 export interface AxisCandidate {
   mesh: string;
-  kind: "cylinder" | "principal";
+  kind: "cylinder" | "principal" | "circle";
   direction: Vec3;
   point: Vec3;
   residual: number;
@@ -12,7 +12,7 @@ export interface AxisCandidate {
 }
 
 // Jacobi diagonalization for the symmetric 3×3 covariance matrix.
-function eigenvectors(c: number[][]): T.Vector3[] {
+export function eigenvectors(c: number[][]): T.Vector3[] {
   const a = c.map((r) => [...r]),
     v = [
       [1, 0, 0],

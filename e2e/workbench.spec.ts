@@ -1,5 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { readFile } from "node:fs/promises";
+import * as T from "three";
+import { STLExporter } from "three/addons/exporters/STLExporter.js";
 test("known scene, motion, validation, project roundtrip, ZIP and static GLB import", async ({
   page,
 }) => {
@@ -41,7 +43,7 @@ test("known scene, motion, validation, project roundtrip, ZIP and static GLB imp
   await page.locator("#download-glb").click();
   const staticPath = await (await glb).path();
   await page.locator("#close-report").click();
-  await page.locator("#glb-file").setInputFiles({
+  await page.locator("#model-file").setInputFiles({
     name: "static-scene.glb",
     mimeType: "model/gltf-binary",
     buffer: await readFile(staticPath),
@@ -97,4 +99,61 @@ test("invalid parent cycle is rejected and restores valid project", async ({
   await expect(page.locator("#toast")).toContainText("循环");
   await page.locator("#verify").click();
   await expect(page.locator("#report-content")).toContainText("通过");
+});
+
+test("ASCII and binary STL use the shared import, link editing and export workflow", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto("/");
+  await expect(page.locator("#import")).toContainText("GLB / STL");
+  await expect(page.locator("#model-file")).toHaveAttribute(
+    "accept",
+    ".glb,.stl",
+  );
+  await page.locator("#scale").selectOption("0.001");
+  await page.locator("#up").selectOption("z");
+  const mesh = new T.Mesh(new T.BoxGeometry(1000, 2000, 3000));
+  mesh.updateMatrixWorld(true);
+  const exporter = new STLExporter();
+  const binary = exporter.parse(mesh, { binary: true });
+  const variants = [
+    { name: "text.stl", buffer: Buffer.from(exporter.parse(mesh)) },
+    {
+      name: "binary.STL",
+      buffer: Buffer.from(
+        binary.buffer as ArrayBuffer,
+        binary.byteOffset,
+        binary.byteLength,
+      ),
+    },
+  ];
+  for (const file of variants) {
+    await page
+      .locator("#model-file")
+      .setInputFiles({ ...file, mimeType: "model/stl" });
+    await expect(page.locator("#scene-title")).toHaveText(file.name, {
+      timeout: 15000,
+    });
+    await expect(page.locator("#scene-meta")).toContainText(
+      "1 个设备 / 1 个连杆",
+    );
+    await expect(page.locator("#mesh-count")).toHaveText("1 MESH");
+    await page.locator("[data-mesh]").first().click();
+    await page.locator("#new-link").click();
+    await page.locator("#link-form button").click();
+    await expect(page.locator("#dof-count")).toContainText("1");
+    const download = page.waitForEvent("download");
+    await page.locator("#export").click();
+    expect((await download).suggestedFilename()).toBe("kinematic-assembly.zip");
+  }
+  await page.locator("#model-file").setInputFiles({
+    name: "bad.stl",
+    mimeType: "model/stl",
+    buffer: Buffer.from("invalid"),
+  });
+  await expect(page.locator("#toast")).toContainText("导入失败");
+  await expect(page.locator("#scene-title")).toHaveText("binary.STL");
+  expect(errors).toEqual([]);
 });

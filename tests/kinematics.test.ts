@@ -96,7 +96,9 @@ test("ZIP includes 3 independent URDFs, combined model, local STL and assembly",
   assert.ok(!robot.includes('link="carriage"'));
   assert.ok(!robot.includes('link="world"'));
   assert.equal((robot.match(/type="revolute"/g) || []).length, 6);
-  const g = new STLLoader().parse(strFromU8(files["meshes/robot_base.stl"]));
+  const g = new STLLoader().parse(
+    new Uint8Array(files["meshes/robot_base.stl"]).buffer,
+  );
   g.computeBoundingBox();
   near(g.boundingBox.getCenter(new T.Vector3()).z, 0.11, 1e-6);
   assert.match(urdf(p), /parent link="carriage"/);

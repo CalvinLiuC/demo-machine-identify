@@ -3,6 +3,18 @@ import type { Project } from "./types.ts";
 export const templates = {
   P: { name: "直线导轨", revolute: 0, prismatic: 1, independent: 1 },
   "6R": { name: "六轴串联机器人", revolute: 6, prismatic: 0, independent: 6 },
+  positioner_1R: {
+    name: "单轴变位机",
+    revolute: 1,
+    prismatic: 0,
+    independent: 1,
+  },
+  positioner_2R: {
+    name: "双轴变位机",
+    revolute: 2,
+    prismatic: 0,
+    independent: 2,
+  },
   "2P-mimic": {
     name: "对称平行夹爪",
     revolute: 0,
@@ -43,6 +55,14 @@ export function templateChecks(p: Project) {
       for (const link of links)
         if (links.filter((l) => l.parent === link.id).length > 1)
           issues.push("6R 模板要求串联链，检测到分支");
+    }
+    if (d.template === "positioner_2R") {
+      if (moving.length === 2) {
+        const child = moving.find(
+          (l) => l.parent === moving[0].id || l.parent === moving[1].id,
+        );
+        if (!child) issues.push("双轴变位机要求串联两个回转副");
+      }
     }
     if (d.template === "2P-mimic" && moving.length === 2) {
       if (moving[0].parent !== moving[1].parent)

@@ -30,6 +30,10 @@ export function urdf(p: Project, device: string = null) {
   ];
   if (!device) chunks.push('<link name="world"/>');
   for (const l of links) {
+    if (l.joint.resolution)
+      chunks.push(
+        `<!-- ${escape(l.id)}: ${l.joint.resolution === "unresolved" ? "unknown motion represented as fixed for review" : "inferred joint candidate; requires confirmation"} -->`,
+      );
     chunks.push(`  <link name="${escape(l.id)}">`);
     if (p.meshes.some((m) => m.link === l.id))
       chunks.push(
@@ -143,13 +147,20 @@ export function assemblyData(p: Project) {
     ],
   };
 }
-export function exportBundle(p: Project) {
+export function exportBundle(
+  p: Project,
+  progress: (message: string, percent: number) => void = () => {},
+) {
   const errors = validate(p);
   if (errors.length) throw Error(errors.join("；"));
   const files: Record<string, Uint8Array> = {},
     put = (name: string, s: string) => (files[name] = strToU8(s));
   const exporter = new STLExporter();
-  for (const l of p.links) {
+  for (const [i, l] of p.links.entries()) {
+    progress(
+      `导出连杆资源 ${i + 1}/${p.links.length}`,
+      10 + (i / p.links.length) * 65,
+    );
     const group = new T.Group();
     for (const m of p.meshes.filter((x) => x.link === l.id)) {
       const g = m.geometry.clone().applyMatrix4(matrix(l.bind).invert());
@@ -157,7 +168,12 @@ export function exportBundle(p: Project) {
     }
     if (group.children.length) {
       group.updateMatrixWorld(true);
-      put(`meshes/${l.id}.stl`, exporter.parse(group));
+      const binary = exporter.parse(group, { binary: true });
+      files[`meshes/${l.id}.stl`] = new Uint8Array(
+        binary.buffer,
+        binary.byteOffset,
+        binary.byteLength,
+      );
     }
     group.children.forEach((m: T.Mesh) => m.geometry.dispose());
   }
@@ -171,12 +187,15 @@ export function exportBundle(p: Project) {
     "cmake_minimum_required(VERSION 3.8)\nproject(kinematic_scene_demo)\nfind_package(ament_cmake REQUIRED)\ninstall(DIRECTORY devices meshes DESTINATION share/${PROJECT_NAME})\ninstall(FILES scene.urdf assembly.json DESTINATION share/${PROJECT_NAME})\nament_package()\n",
   );
   put("scene.urdf", urdf(p));
+  if (p.analysis) put("recognition.json", JSON.stringify(p.analysis, null, 2));
   put("assembly.json", JSON.stringify(assemblyData(p), null, 2));
+  progress("保存项目与参数依据", 80);
   put("project.json", JSON.stringify(projectData(p)));
   put(
     "README.txt",
     "Kinematic Scene Lab\nUnits: meters, right-handed Z-up.\nThis folder is a ROS 2 ament_cmake resource package named kinematic_scene_demo. Place it in a workspace src folder, run colcon build, then source install/setup.bash (Windows: install/setup.ps1). Mesh paths use package://kinematic_scene_demo/meshes/*.stl. Standalone consumers must configure a package resolver for this folder. ROS runtime integration was not tested by this browser demo.\nOpen scene.urdf, or load individual devices/*.urdf at identity and apply assembly.json installation transforms.\ninitialState=0 is the imported model reference, NOT manufacturer zero. previewState contains the UI values; mimic joints follow their source.\nAll motion ranges are DEMO ranges. URDF effort/velocity are placeholders. No dynamics, collision or physical limits are provided.\nMeshes are exported to link-local STL (material and texture are not preserved in URDF). project.json preserves geometry and basic colors for reopening this demo.\n",
   );
+  progress("压缩装配资源包", 90);
   return zipSync(files);
 }
 export function reconstructionError(p: Project) {

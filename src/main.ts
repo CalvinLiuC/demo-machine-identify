@@ -3,7 +3,7 @@ import * as T from "three";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { Viewer } from "./viewer.ts";
 import { demo } from "./demo.ts";
-import { importGLB, splitConnected } from "./import.ts";
+import { importModel, splitConnected } from "./import.ts";
 import {
   analyzeGeometry,
   bindAt,
@@ -13,7 +13,6 @@ import {
 } from "./model.ts";
 import {
   assemblyData,
-  exportBundle,
   projectData,
   reconstructionError,
   restoreProject,
@@ -23,6 +22,19 @@ import type { Project, Vec3, JointType } from "./types.ts";
 import { axisCandidates } from "./geometry.ts";
 import { templateChecks } from "./templates.ts";
 import { railProposals } from "./rail-template.ts";
+import {
+  processSTL,
+  processProject,
+  exportProjectInWorker,
+} from "./processing-client.ts";
+import { applySceneAnalysis } from "./scene-analysis.ts";
+import { recognitionHTML } from "./recognition-ui.ts";
+import { snapshotProject } from "./project-transfer.ts";
+import {
+  resultDevices,
+  resultsPanelHTML,
+  selectionDescription,
+} from "./results-panel.ts";
 
 const $ = <E extends HTMLElement = HTMLElement>(id: string) =>
   document.getElementById(id) as E;
@@ -42,20 +54,56 @@ let project: Project = demo(),
   playing = false,
   playTime = 0;
 let report: ReturnType<typeof analyzeGeometry> | null = null;
-let history: string[] = [];
+let history: Project[] = [];
 const app = $("app");
 app.innerHTML = `
 <header><div class="brand"><span class="brand-mark">K<span>↗</span></span><div><strong>KINEMATIC <b>LAB</b></strong><small>工业场景 · 运动学重建工作台</small></div></div><div class="header-status"><i></i> 本地处理 <span>/</span> DEMO 0.1</div><div class="header-actions"><button id="sample">载入示例</button><button id="open-project">打开项目</button><button id="save">保存项目</button><button id="export" class="primary">↗ 导出装配包</button></div></header>
 <section class="workflow"><span class="step done">01 <b>导入场景</b></span><em>—</em><span class="step done">02 <b>设备与连杆</b></span><em>—</em><span class="step current">03 <b>关节与装配</b></span><em>—</em><span class="step">04 <b>验证与导出</b></span><span class="workflow-note">仅运动学 · 不包含动力学参数</span></section>
-<main><aside class="left"><div class="panel-heading"><h2>场景资源</h2><span id="mesh-count"></span></div><button id="import" class="import-button"><span>＋</span><strong>导入 GLB 场景</strong><small>文件仅在浏览器本地处理</small></button><div class="import-options"><label>尺度<select id="scale"><option value="1">米 · ×1</option><option value="0.001">毫米 · ×0.001</option><option value="0.01">厘米 · ×0.01</option></select></label><label>源上方向<select id="up"><option value="y">Y-up / glTF</option><option value="z">Z-up</option></select></label></div><div class="tabs"><button id="structure-tab" class="active">装配结构</button><button id="geometry-tab">几何列表</button></div><div id="tree" class="tree"></div><div class="left-bottom"><div class="legend"><i class="amber"></i>旋转关节 <i class="cyan"></i>移动关节</div><button id="analyze">◇ 几何候选分析</button><button id="new-device">＋ 从选择建立设备</button><button id="new-link">＋ 从选择建立连杆</button><button id="split">分离选中网格的连通分量</button><p>点击选择 · Ctrl / Shift 多选<br>几何分组 ≠ 已确认的机械结构</p></div></aside>
+<main><aside class="left"><div class="panel-heading"><h2>场景资源</h2><span id="mesh-count"></span></div><button id="import" class="import-button"><span>＋</span><strong>导入 GLB / STL</strong><small>文件仅在浏览器本地处理</small></button><div class="import-options"><label>尺度<select id="scale"><option value="1">米 · ×1</option><option value="0.001">毫米 · ×0.001</option><option value="0.01">厘米 · ×0.01</option></select></label><label>源上方向<select id="up"><option value="auto">按格式（STL Z / GLB Y）</option><option value="y">Y-up</option><option value="z">Z-up</option></select></label></div><div class="tabs"><button id="structure-tab" class="active">装配结构</button><button id="geometry-tab">几何列表</button></div><div id="tree" class="tree"></div><div class="left-bottom"><div class="legend"><i class="amber"></i>旋转关节 <i class="cyan"></i>移动关节</div><button id="analyze">◇ 几何候选分析</button><button id="new-device">＋ 从选择建立设备</button><button id="new-link">＋ 从选择建立连杆</button><button id="split">分离选中网格的连通分量</button><p>点击选择 · Ctrl / Shift 多选<br>几何分组 ≠ 已确认的机械结构</p></div></aside>
 <section class="center"><div class="viewport-header"><div><span class="live-dot"></span><strong id="scene-title"></strong><small id="scene-meta"></small></div><div class="view-buttons"><select id="colors"><option value="device">按设备着色</option><option value="link">按连杆着色</option><option value="original">原始颜色</option></select><button id="fit" title="适配场景">⌖ 适配</button><button id="axes" class="active">轴线</button><button id="wire">线框</button></div></div><div id="viewport"><div class="viewport-tag">PERSPECTIVE <span> / Z-UP / METERS</span></div><div class="axis-legend"><b class="x">X</b><b class="y">Y</b><b class="z">Z</b><span>左键旋转 · 右键平移 · 滚轮缩放</span></div><div id="selection-hint"></div></div><section class="motion"><div class="motion-heading"><div><span class="eyebrow">KINEMATIC PREVIEW</span><h2>关节运动预览 <small id="dof-count"></small></h2></div><div><button id="play">▷ 自动演示</button><button id="reset">↺ 参考姿态</button><button id="verify">✓ 验证模型</button></div></div><div id="sliders" class="sliders"></div><p class="motion-note">所有滑块范围均为演示范围；参考零位为导入姿态，不代表厂商零位。联动关节由源关节驱动。</p></section></section>
-<aside class="right"><div class="panel-heading"><h2>参数与证据</h2><span class="tag">INSPECTOR</span></div><div id="inspector"></div></aside></main>
-<footer><span id="status">已载入已知机构示例。可以逐轴预览，或导入自己的 GLB。</span><span id="summary"></span></footer><div id="toast" role="status"></div>
-<input id="glb-file" type="file" accept=".glb" hidden><input id="project-file" type="file" accept=".json" hidden>
+<aside class="right"><div class="panel-heading"><h2>识别与参数</h2><span class="tag">INSPECTOR</span></div><div id="inspector"></div></aside></main>
+<footer><span id="status">已载入已知机构示例。可以逐轴预览，或导入自己的 GLB / STL。</span><span id="summary"></span></footer><div id="toast" role="status"></div>
+<input id="model-file" type="file" accept=".glb,.stl" hidden><input id="project-file" type="file" accept=".json" hidden>
 <dialog id="report"><div class="dialog-heading"><h2 id="report-title"></h2><button id="close-report">关闭 ✕</button></div><div id="report-content"></div></dialog>`;
+const autoButton = document.createElement("button");
+const resultsPanel = document.createElement("section");
+resultsPanel.id = "recognition-panel";
+resultsPanel.setAttribute("aria-label", "设备识别结果");
+$("inspector").before(resultsPanel);
+const selectionBar = document.createElement("div");
+selectionBar.id = "selection-bar";
+selectionBar.innerHTML =
+  '<div class="selection-caption"><i></i><div><strong id="selection-title"></strong><small id="selection-detail"></small></div></div><div class="selection-actions"><button id="focus-selection">⌖ 定位选中</button><button id="isolate-selection" aria-pressed="false">仅显示选中</button><button id="clear-selection">清除选择</button></div>';
+$("viewport").append(selectionBar);
+autoButton.id = "auto-reconstruct";
+autoButton.textContent = "自动拆分与机构分析";
+$("analyze").before(autoButton);
+const processing = document.createElement("dialog");
+processing.id = "processing";
+processing.innerHTML =
+  '<h3>后台场景处理</h3><p id="processing-message" role="status">正在准备…</p><progress id="processing-progress" max="100" value="0"></progress><p class="muted">本地计算，不上传模型。</p>';
+document.body.append(processing);
+processing.addEventListener("cancel", (e) => e.preventDefault());
+function progress(message: string, percent: number) {
+  $("processing-message").textContent = message;
+  ($("processing-progress") as HTMLProgressElement).value = percent;
+  $("status").textContent = message;
+}
+function startProcessing() {
+  stopPlay();
+  progress("读取并规范化模型", 0);
+  processing.showModal();
+}
 let viewer: Viewer;
 try {
   viewer = new Viewer($("viewport"), (id, multi) => {
+    if (id === null) {
+      if (!multi) {
+        selected.clear();
+        render();
+      }
+      return;
+    }
     if (!multi) selected.clear();
     selected.has(id) ? selected.delete(id) : selected.add(id);
     active = project.meshes.find((m) => m.id === id)?.link || active;
@@ -73,7 +121,7 @@ function notify(message: string) {
   setTimeout(() => $("toast").classList.remove("visible"), 4000);
 }
 function checkpoint() {
-  history.push(JSON.stringify(projectData(project)));
+  history.push(snapshotProject(project));
   if (history.length > 12) history.shift();
 }
 function load(p: Project) {
@@ -95,6 +143,12 @@ function render() {
   $("scene-meta").textContent =
     `${project.devices.length} 个设备 / ${project.links.length} 个连杆`;
   $("mesh-count").textContent = `${project.meshes.length} MESH`;
+  autoButton.textContent = project.analysis
+    ? "重新机构分析"
+    : "自动拆分与机构分析";
+  $("analyze").textContent = project.analysis
+    ? `查看识别候选 · ${project.analysis.devices.filter((d) => d.kind === "articulated").length} 个机构`
+    : "◇ 几何候选分析";
   $("selection-hint").textContent = selected.size
     ? `已选择 ${selected.size} 个几何 · 可分配到连杆`
     : "选择几何以检查归属";
@@ -104,7 +158,123 @@ function render() {
   renderInspector();
   renderSliders();
   refresh();
+  renderResultsPanel();
+  const description = selectionDescription(
+    project,
+    resultDevices(project),
+    selected,
+  );
+  $("selection-title").textContent = description.title;
+  $("selection-detail").textContent = description.detail;
+  selectionBar.classList.toggle("empty", !selected.size);
+  ($("focus-selection") as HTMLButtonElement).disabled = !selected.size;
+  ($("isolate-selection") as HTMLButtonElement).disabled = !selected.size;
+  $("isolate-selection").setAttribute(
+    "aria-pressed",
+    String(viewer.isolateSelection),
+  );
+  $("isolate-selection").textContent = viewer.isolateSelection
+    ? "退出隔离"
+    : "仅显示选中";
 }
+function selectResult(ids: string[], focus = false) {
+  selected = new Set(ids);
+  active = project.meshes.find((m) => selected.has(m.id))?.link || active;
+  render();
+  if (focus) viewer.focusSelection();
+}
+function renderResultsPanel() {
+  const scrollTop = resultsPanel.querySelector(".results-list")?.scrollTop || 0;
+  const open = new Set(
+    Array.from(
+      resultsPanel.querySelectorAll<HTMLDetailsElement>("details[open]"),
+    ).map((d) => d.dataset.resultDetails),
+  );
+  const entries = resultDevices(project);
+  resultsPanel.innerHTML = resultsPanelHTML(
+    entries,
+    selected,
+    open,
+    project.analysis?.algorithmVersion,
+  );
+  resultsPanel.querySelector(".results-list").scrollTop = scrollTop;
+  const list = resultsPanel.querySelector<HTMLElement>(".results-list"),
+    card = resultsPanel.querySelector<HTMLElement>(
+      ".result-card.has-selection",
+    );
+  if (card) {
+    const target =
+      card.clientHeight <= list.clientHeight
+        ? card
+        : card.querySelector<HTMLElement>(".result-link.selected") || card;
+    const rect = target.getBoundingClientRect(),
+      bounds = list.getBoundingClientRect();
+    if (rect.top < bounds.top) list.scrollTop += rect.top - bounds.top - 4;
+    else if (rect.bottom > bounds.bottom)
+      list.scrollTop += rect.bottom - bounds.bottom + 4;
+  }
+  resultsPanel
+    .querySelectorAll<HTMLButtonElement>("[data-result-device]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          selectResult(
+            entries.find((d) => d.id === b.dataset.resultDevice).meshIds,
+          )),
+    );
+  resultsPanel
+    .querySelectorAll<HTMLButtonElement>("[data-result-focus]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          selectResult(
+            entries.find((d) => d.id === b.dataset.resultFocus).meshIds,
+            true,
+          )),
+    );
+  resultsPanel
+    .querySelectorAll<HTMLButtonElement>("[data-result-link]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          selectResult(
+            entries
+              .flatMap((d) => d.links)
+              .find((l) => l.id === b.dataset.resultLink).meshIds,
+          )),
+    );
+  $("results-evidence").onclick = () => $("analyze").click();
+  if ($("results-apply"))
+    $("results-apply").onclick = applyRecognitionCandidates;
+}
+function applyRecognitionCandidates() {
+  try {
+    if (!project.analysis) return;
+    checkpoint();
+    stopPlay();
+    applySceneAnalysis(project, project.analysis);
+    active = project.links[0]?.id;
+    selected.clear();
+    tab = "structure";
+    colorMode = "link";
+    ($("colors") as HTMLSelectElement).value = "link";
+    if (($("report") as HTMLDialogElement).open)
+      ($("report") as HTMLDialogElement).close();
+    render();
+    notify("已应用待确认候选。点击识别结果卡片选择设备，逐轴核验。");
+  } catch (error) {
+    notify(`候选应用失败：${(error as Error).message}`);
+  }
+}
+$("focus-selection").onclick = () => viewer.focusSelection();
+$("clear-selection").onclick = () => {
+  selected.clear();
+  render();
+};
+$("isolate-selection").onclick = () => {
+  viewer.isolateSelection = !viewer.isolateSelection;
+  render();
+};
 function renderTree() {
   $("structure-tab").classList.toggle("active", tab === "structure");
   $("geometry-tab").classList.toggle("active", tab === "geometry");
@@ -212,7 +382,7 @@ function renderInspector() {
     const fd = new FormData(e.currentTarget as HTMLFormElement);
     const n = (k: string) => Number(fd.get(k)),
       str = (k: string) => String(fd.get(k) || "");
-    const before = JSON.stringify(projectData(project));
+    const before = snapshotProject(project);
     l.name = str("name");
     l.device = str("device");
     l.parent = str("parent") || null;
@@ -239,7 +409,7 @@ function renderInspector() {
     if (external && l.joint.type !== "fixed")
       errors.push("设备间安装必须为固定连接；可运动副请建在设备内部");
     if (errors.length) {
-      load(restoreProject(JSON.parse(before)));
+      load(before);
       notify(`未应用：${errors.join("；")}`);
       return;
     }
@@ -271,12 +441,34 @@ function renderInspector() {
       notify("请先选择圆柱形或长条形几何。");
       return;
     }
-    const candidates = project.meshes
-      .filter((m) => selected.has(m.id))
-      .flatMap(axisCandidates);
+    const inferred = project.analysis?.devices
+      .flatMap((d) =>
+        d.links.map((link, i) => ({ link, id: `${d.id}_link_${i}` })),
+      )
+      .find((x) => x.id === l.id)?.link.joint;
+    const candidates = [
+      ...(inferred?.alternatives || []).map((c) => ({
+        mesh: c.mesh,
+        kind: "circle" as const,
+        direction: c.axis,
+        point: c.point,
+        residual: c.error,
+        radius: c.radius,
+        evidence: `${c.method === "bolt-pattern" ? "法兰孔阵列" : c.method === "outer-profile" ? "转台外轮廓" : "局部圆形端面"}；半径 ${(c.radius * 1000).toFixed(2)} mm；误差 ${(c.error * 1000).toFixed(3)} mm；不是已确认转轴。`,
+      })),
+      ...project.meshes
+        .filter((m) => selected.has(m.id))
+        .sort(
+          (a, b) =>
+            b.geometry.attributes.position.count -
+            a.geometry.attributes.position.count,
+        )
+        .slice(0, 8)
+        .flatMap(axisCandidates),
+    ];
     showReport(
       "几何轴线候选",
-      `<div class="notice">仅对完整网格进行 PCA / 圆柱拟合。外壳圆柱不必然是关节，正方向和真实零位仍需确认。候选点与方向使用规范化场景坐标。</div><table><thead><tr><th>几何 / 方法</th><th>依据</th><th></th></tr></thead><tbody>${candidates.map((c, i) => `<tr><td>${esc(project.meshes.find((m) => m.id === c.mesh)?.name)}<small>${c.kind === "cylinder" ? "圆柱拟合" : "PCA 主轴"}</small></td><td>${esc(c.evidence)}<small>轴向 ${c.direction.map((n) => n.toFixed(3)).join(", ")}</small></td><td><button data-candidate="${i}">应用候选</button></td></tr>`).join("")}</tbody></table>`,
+      `<div class="notice">包含历史机构分析的局部端面备选，以及最多 8 个所选网格的 PCA / 圆柱拟合。外壳圆柱不必然是关节，正方向和真实零位仍需确认。候选点与方向使用规范化场景坐标。</div><table><thead><tr><th>几何 / 方法</th><th>依据</th><th></th></tr></thead><tbody>${candidates.map((c, i) => `<tr><td>${esc(project.meshes.find((m) => m.id === c.mesh)?.name)}<small>${c.kind === "cylinder" ? "圆柱拟合" : c.kind === "circle" ? "局部圆形端面" : "PCA 主轴"}</small></td><td>${esc(c.evidence)}<small>轴向 ${c.direction.map((n) => n.toFixed(3)).join(", ")}</small></td><td><button data-candidate="${i}">应用候选</button></td></tr>`).join("")}</tbody></table>`,
     );
     document.querySelectorAll<HTMLButtonElement>("[data-candidate]").forEach(
       (b) =>
@@ -300,7 +492,7 @@ function renderInspector() {
   };
   $("undo").onclick = () => {
     const old = history.pop();
-    if (old) load(restoreProject(JSON.parse(old)));
+    if (old) load(old);
   };
   $("urdf-preview").onclick = () =>
     showReport(
@@ -311,14 +503,14 @@ function renderInspector() {
 function renderSliders() {
   const links = project.links.filter((l) => l.joint.type !== "fixed");
   $("dof-count").textContent =
-    `${links.filter((l) => !l.joint.mimic).length} 独立自由度`;
+    `场景合计 ${links.filter((l) => !l.joint.mimic).length} 自由度`;
   $("sliders").innerHTML =
     links
       .map((l) => {
         const j = l.joint,
           q = j.value || 0,
           rotation = j.type === "revolute";
-        return `<div class="slider-card ${j.mimic ? "mimic" : ""}"><div><span class="joint-icon ${j.type}">${rotation ? "↻" : "↔"}</span><strong>${esc(l.name)}</strong><output id="value-${l.id}">${rotation ? ((q * 180) / Math.PI).toFixed(1) + "°" : (q * 1000).toFixed(1) + " mm"}</output></div><input aria-label="${esc(l.name)}" data-slider="${esc(l.id)}" type="range" min="${j.lower}" max="${j.upper}" step="${rotation ? 0.005 : 0.0005}" value="${q}" ${j.mimic ? "disabled" : ""}><small>${j.mimic ? "联动 ← " + esc(j.mimic) : "DEMO RANGE · " + (rotation ? "R" : "P")}</small></div>`;
+        return `<div class="slider-card ${j.mimic ? "mimic" : ""}"><div><span class="joint-icon ${j.type}">${rotation ? "↻" : "↔"}</span><strong>${esc(l.kinematicIndex ? `J${l.kinematicIndex} \u00b7 L${l.kinematicIndex - 1} \u2192 L${l.kinematicIndex}` : l.name)}</strong><output id="value-${l.id}">${rotation ? ((q * 180) / Math.PI).toFixed(1) + "°" : (q * 1000).toFixed(1) + " mm"}</output></div><input aria-label="${esc(l.name)}" data-slider="${esc(l.id)}" type="range" min="${j.lower}" max="${j.upper}" step="${rotation ? 0.005 : 0.0005}" value="${q}" ${j.mimic ? "disabled" : ""}><small>${j.mimic ? "联动 ← " + esc(j.mimic) : "DEMO RANGE · " + (rotation ? "R" : "P")}</small></div>`;
       })
       .join("") ||
     '<p class="muted">还没有运动关节。选择连杆，在右侧定义关节。</p>';
@@ -403,7 +595,11 @@ $("geometry-tab").onclick = () => {
   tab = "geometry";
   renderTree();
 };
-$("fit").onclick = () => viewer.fit();
+$("fit").onclick = () => {
+  viewer.isolateSelection = false;
+  render();
+  viewer.fit();
+};
 $("axes").onclick = () => {
   axes = !axes;
   $("axes").classList.toggle("active", axes);
@@ -418,30 +614,54 @@ $("colors").onchange = (e) => {
   colorMode = (e.target as HTMLSelectElement).value;
   refresh();
 };
-$("import").onclick = () => ($("glb-file") as HTMLInputElement).click();
-$("glb-file").onchange = async (e) => {
+$("import").onclick = () => ($("model-file") as HTMLInputElement).click();
+$("model-file").onchange = async (e) => {
   const input = e.target as HTMLInputElement,
     file = input.files?.[0];
   if (!file) return;
-  notify("正在读取本地 GLB…");
+  notify("正在读取本地模型…");
+  startProcessing();
   try {
-    const p = await importGLB(
+    const importer = file.name.toLowerCase().endsWith(".stl")
+      ? processSTL
+      : importModel;
+    const p = await importer(
       file,
       Number(($("scale") as HTMLSelectElement).value),
       ($("up") as HTMLSelectElement).value,
+      progress,
     );
     checkpoint();
     load(p);
     tab = "geometry";
     render();
     notify(
-      `已导入 ${p.meshes.length} 个几何区域。请分析候选并确认设备与连杆。`,
+      p.analysis
+        ? `已自动拆分 ${p.meshes.length} 个几何分量。点击「查看识别候选」审阅设备和关节。`
+        : `已导入 ${p.meshes.length} 个几何区域。请分析候选并确认设备与连杆。`,
     );
   } catch (err) {
     notify(`导入失败：${(err as Error).message}`);
   } finally {
+    processing.close();
     input.value = "";
   }
+};
+autoButton.onclick = async () => {
+  if (($("report") as HTMLDialogElement).open)
+    ($("report") as HTMLDialogElement).close();
+  startProcessing();
+  try {
+    const p = await processProject(project, progress);
+    checkpoint();
+    load(p);
+    notify("已完成自动几何分析，结果待确认。");
+  } catch (error) {
+    notify(`分析失败：${(error as Error).message}`);
+  } finally {
+    processing.close();
+  }
+  if (project.analysis) $("analyze").click();
 };
 $("save").onclick = () =>
   download(
@@ -466,13 +686,16 @@ $("project-file").onchange = async (e) => {
     input.value = "";
   }
 };
-$("export").onclick = () => {
+$("export").onclick = async () => {
+  startProcessing();
   try {
-    const files = exportBundle(project);
+    const files = await exportProjectInWorker(project, progress);
     download("kinematic-assembly.zip", files as BlobPart);
     notify("已导出独立设备 URDF、整体 URDF、局部 STL、装配关系和可重开项目。");
   } catch (e) {
     notify(`导出失败：${(e as Error).message}`);
+  } finally {
+    processing.close();
   }
 };
 $("reset").onclick = () => {
@@ -510,7 +733,7 @@ $("new-device").onclick = () => {
   }
   showReport(
     "从选择建立设备",
-    `<form id="device-form" class="create-form"><label class="field">设备名称<input name="name" value="新设备" required></label><label class="field">构型模板<select name="template"><option value="unknown">未知 / 手工建模</option><option value="P">直线导轨 · P</option><option value="6R">六轴机器人 · 6R</option><option value="2P-mimic">平行夹爪 · 双 P 联动</option><option value="static">静态工具 / 底座</option></select></label><p class="muted">模板只声明预期构型，不自动猜测被遮挡的关节。创建后请逐个分配运动连杆和轴线。</p><button class="primary">建立设备</button></form>`,
+    `<form id="device-form" class="create-form"><label class="field">设备名称<input name="name" value="新设备" required></label><label class="field">构型模板<select name="template"><option value="unknown">未知 / 手工建模</option><option value="P">直线导轨 · P</option><option value="6R">六轴机器人 · 6R</option><option value="2P-mimic">平行夹爪 · 双 P 联动</option><option value="positioner_1R">单轴变位机 · R</option><option value="positioner_2R">双轴变位机 · RR</option><option value="gripper_candidate">夹爪 · 运动待确认</option><option value="static">静态工具 / 底座</option></select></label><p class="muted">模板只声明预期构型，不自动猜测被遮挡的关节。创建后请逐个分配运动连杆和轴线。</p><button class="primary">建立设备</button></form>`,
   );
   $("device-form").onsubmit = (e) => {
     e.preventDefault();
@@ -609,6 +832,7 @@ $("split").onclick = () => {
     }
     const old = project.meshes;
     project.meshes = result;
+    delete project.analysis;
     old.filter((m) => selected.has(m.id)).forEach((m) => m.geometry.dispose());
     selected.clear();
     viewer.load(project);
@@ -636,8 +860,35 @@ $("analyze").onclick = () => {
   });
   showReport(
     "几何候选分析",
-    `<div class="notice">本版使用确定性包围盒与长宽比分析，只生成几何候选，不推断真实关节或安装关系。内置示例使用已知模板。</div><div class="report-actions"><button id="download-glb">下载无运动学 GLB 测试样本</button></div><table><thead><tr><th>几何</th><th>尺寸 / m</th><th>候选与依据</th></tr></thead><tbody>${report.map((r) => `<tr><td>${esc(r.name)}<small>${r.triangles.toFixed(0)} triangles</small></td><td>${r.size.map((n) => n.toFixed(3)).join(" × ")}</td><td><strong>${esc(r.category)}</strong><small>${esc(r.basis)}</small><span class="badge">${r.status}</span></td></tr>`).join("")}</tbody></table>`,
+    `<div class="notice">下表仅为包围盒与长宽比粗分析；可通过「自动拆分与机构分析」生成设备和关节候选。</div><div class="report-actions"><button id="download-glb">下载无运动学 GLB 测试样本</button></div><table><thead><tr><th>几何</th><th>尺寸 / m</th><th>候选与依据</th></tr></thead><tbody>${report.map((r) => `<tr><td>${esc(r.name)}<small>${r.triangles.toFixed(0)} triangles</small></td><td>${r.size.map((n) => n.toFixed(3)).join(" × ")}</td><td><strong>${esc(r.category)}</strong><small>${esc(r.basis)}</small><span class="badge">${r.status}</span></td></tr>`).join("")}</tbody></table>`,
   );
+  if (project.analysis) {
+    $("report-content").insertAdjacentHTML(
+      "afterbegin",
+      recognitionHTML(project.analysis),
+    );
+    $("apply-recognition").onclick = applyRecognitionCandidates;
+    $("export-recognition").onclick = () =>
+      download(
+        "scene-recognition.json",
+        JSON.stringify(project.analysis, null, 2),
+        "application/json",
+      );
+    const inspect = (ids: string[]) => {
+      selected = new Set(ids);
+      active = project.meshes.find((m) => selected.has(m.id))?.link || active;
+      ($("report") as HTMLDialogElement).close();
+      render();
+    };
+    if ($("inspect-ambiguous"))
+      $("inspect-ambiguous").onclick = () =>
+        inspect(project.analysis.ambiguousMeshes);
+    document
+      .querySelectorAll<HTMLButtonElement>("[data-preview-group]")
+      .forEach(
+        (b) => (b.onclick = () => inspect(b.dataset.previewGroup.split(","))),
+      );
+  }
   $("report-content").insertAdjacentHTML(
     "afterbegin",
     `<h3>直线导轨模板匹配</h3><p class="muted">当前仅支持 Z-up 场景中沿 X/Y 的双轮廓导轨与单网格滑台；只对未分类、未确认几何提供分组建议。</p>${proposals.length ? proposals.map((c, i) => `<div class="notice"><strong>候选 ${i + 1}：固定体 ${c.fixedMeshes.length} 个网格 + 1 个滑台</strong><ul>${c.evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul><button data-rail="${i}">确认分组并建立 P 运动副候选</button></div>`).join("") : '<p class="muted">没有满足此模板全部条件的未分类候选。可继续人工分组，不强行匹配。</p>'}`,
@@ -756,13 +1007,22 @@ $("verify").onclick = () => {
 $("close-report").onclick = () => ($("report") as HTMLDialogElement).close();
 document.addEventListener("keydown", (e) => {
   if (
+    e.key === "Escape" &&
+    !($("report") as HTMLDialogElement).open &&
+    !processing.open &&
+    !["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)
+  ) {
+    selected.clear();
+    render();
+  }
+  if (
     (e.ctrlKey || e.metaKey) &&
     e.key === "z" &&
     !["INPUT", "TEXTAREA", "SELECT"].includes((e.target as HTMLElement).tagName)
   ) {
     e.preventDefault();
     const old = history.pop();
-    if (old) load(restoreProject(JSON.parse(old)));
+    if (old) load(old);
   }
 });
 viewer.load(project);
